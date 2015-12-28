@@ -1,0 +1,1 @@
+cmd_/root/lsm_stacker/lsm_stacker.ko := ld -r -m elf_x86_64 -T /usr/src/kernels/3.10.0-229.20.1.el7.x86_64/scripts/module-common.lds --build-id  -o /root/lsm_stacker/lsm_stacker.ko /root/lsm_stacker/lsm_stacker.o /root/lsm_stacker/lsm_stacker.mod.o
