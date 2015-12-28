@@ -1,1 +1,0 @@
-cmd_/root/lsm_stacker/lsm_stacker.o := ld -m elf_x86_64   -r -o /root/lsm_stacker/lsm_stacker.o /root/lsm_stacker/stacker.o /root/lsm_stacker/probe.o ; scripts/mod/modpost /root/lsm_stacker/lsm_stacker.o
