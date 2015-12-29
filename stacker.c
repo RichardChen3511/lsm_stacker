@@ -7,6 +7,7 @@
 #include <linux/rwsem.h>
 static hlist_head stacker_head;
 static atomic_t lsm_stacker_ref = ATOMIC_INIT(0);
+static security_operations lsm_stacker_ops;
 
 #define LOCK_STACKER_FOR_READING do { atomic_inc(&lsm_staker_ref); } while(0)
 #define UNLOCK_STACKER_FOR_READING do { atomic_dec(&lsm_stacker_ref); } while(0)
@@ -38,11 +39,55 @@ static atomic_t lsm_stacker_ref = ATOMIC_INIT(0);
 	} \
 	UNLOCK_STACKER_FOR_READING; } while (0)
 	
-
+static char *module_name = "lsm_stacker";
 static int __init lsm_stacker_init (void)
 {
-	return 0;
+	int res;
+	struct sec_module *old_modules;
+	strcut secrity_operations **orignal_ops;
+
+	INIT_HLIST_HEAD(&stacker_head);
+
+	if (!security_reigster(&lsm_stacker_ops)) 
+		goto has_reg;
+	printk(KERN_INFO "has security module register");
+
+	if (!security_mod_register(module_name, &lsm_stacker_ops)) 
+		goto has_reg;
+	printk(KERN_INFO "current security module is not support"
+					"nultiple security modules");
+
+	orignal_ops = (struct security_operations **) 
+								__symbol_get("security_ops");
+
+	if (!orgnal_ops) {
+		res = -1; 
+		printk(KERN_ERR "get security_ops symbol fail\n");
+		goto out;
+	}
+
+	old_modules = kmalloc(sizeof(*old_modules), GFP_KERNEL);
+	if (!old_modules) {
+		res = -ENOMEM;
+		goto out;
+	}
+
+	old_modules->ops = *orignal_ops;
+	old_modules->modname = "orignal_sec_modules";
+	INIT_HLIST_NODE(&old_modules->hlist);
+	hlist_add_tail(&old_modules->hlist, &stacker_head);
+
+	smp_wmb();
+	*orignal_ops = &lsm_stacker_ops;
+	smb_wmb();
+
+has_reg:
+	printk(KERN_INFO "LSM STACKER MODULES REGISTER SUCCESS\n");
+
+out:
+	return res;
 }
+
 
 static void __exit lsm_stacker_exit (void)
 {
@@ -56,5 +101,3 @@ module_exit (lsm_stacker_exit);
 MODULE_DESCRIPTION("LSM Stacker - supports multiple simultaneous LSM modules");
 MODULE_AUTHOR("Richard Chen");
 MODULE_LICENSE("GPL v2");
-
-
