@@ -1,5 +1,7 @@
 #include "stacker.h"
+static struct sec_module *old_modules;
 static struct hlist_head stacker_head;
+static security_fixup_t lsm_default_fixup_ops;
 static atomic_t lsm_stacker_ref = ATOMIC_INIT(0);
 
 #define LOCK_STACKER_FOR_READING do { atomic_inc(&lsm_stacker_ref); } while(0)
@@ -22,6 +24,8 @@ static atomic_t lsm_stacker_ref = ATOMIC_INIT(0);
 	}														   \
 	UNLOCK_STACKER_FOR_READING;								   \
 	return final_result; } while (0)
+
+
 
 #define CALL_ALL(FUNCTION_TO_CALL) do { \
   struct sec_module *tpos;											\
@@ -303,7 +307,25 @@ int stacker_inode_removexattr (struct dentry *dentry, char *name)
 {
     RETURN_ERROR_IF_ANY_ERROR(inode_removexattr(dentry, name));
 }
-const char *(*inode_xattr_getsuffix) (void);
+const char *stacker_inode_xattr_getsuffix (void)
+{
+	const char *result = NULL;
+	struct hlist_node *pos; 
+	struct sec_module *tpos; 
+	LOCK_STACKER_FOR_READING; 
+	hlist_for_each_entry_rcu(tpos, pos, &stacker_head, hlist) {
+		struct security_operations *ops = get_mod(tpos);	
+		if (ops->inode_xattr_getsuffix) {
+			result = ops->inode_xattr_getsuffix();
+			put_mod(tpos);
+			break;
+		}
+
+		put_mod(tpos);
+	}			
+	UNLOCK_STACKER_FOR_READING;
+	return result; 
+}
 int stacker_inode_getsecurity(const struct inode *inode, const char *name, void *buffer, size_t size, int err)
 {
     RETURN_ERROR_IF_ANY_ERROR(
@@ -576,13 +598,51 @@ int stacker_netlink_recv (struct sk_buff * skb, int cap)
 int stacker_register_security (const char *name,
                           struct security_operations *ops)
 {
-    RETURN_ERROR_IF_ANY_ERROR(register_security(name, ops));
+	struct sec_module *secmod;
+	char *modname;
+ 	secmod =  kmalloc(sizeof(*old_modules), GFP_KERNEL);
+	if (!secmod) 
+		return -ENOMEM;
+	init_sec_module(secmod);
+	modname = kmalloc(strlen(name)+1, GFP_KERNEL);
+	if (!modname) {
+		kfree(secmod);
+		return -ENOMEM;
+	}
+
+	if (lsm_default_fixup_ops)
+		lsm_default_fixup_ops(ops);
+	strcpy(modname, name);
+	secmod->modname = modname;
+	secmod->ops = ops;
+	hlist_add_head_rcu(&secmod->hlist, &stacker_head);
+	return 0;
+	
 }
 int stacker_unregister_security (const char *name,
                             struct security_operations *ops)
 {
-    RETURN_ERROR_IF_ANY_ERROR(unregister_security(name, ops));
+	struct hlist_node *pos; 
+	struct sec_module *tpos; 
+	LOCK_STACKER_FOR_READING; 
+	hlist_for_each_entry_rcu(tpos, pos, &stacker_head, hlist) {
+		get_mod(tpos);
+	 	if (!strcmp(name, tpos->modname)) {
+			goto unreg;
+		}
+		put_mod(tpos);
+	}
+	
+	return -1;
+
+unreg:
+	hlist_del_rcu(&tpos->hlist);
+	while (atomic_read(&tpos->mod_ref) != 2);
+	kfree(tpos->modname);
+	kfree(tpos);
+	return 0;
 }
+
 
 void stacker_d_instantiate (struct dentry *dentry, struct inode *inode)
 {
@@ -621,10 +681,10 @@ int stacker_socket_create (int family, int type, int protocol, int kern)
 {
     RETURN_ERROR_IF_ANY_ERROR(socket_create(family, type, protocol, kern));
 }
-void stacker_socket_post_create (struct socket * sock, int family,
+int stacker_socket_post_create (struct socket * sock, int family,
                             int type, int protocol, int kern)
 {
-    CALL_ALL(socket_post_create(sock, family, type, protocol, kern));
+    RETURN_ERROR_IF_ANY_ERROR(socket_post_create(sock, family, type, protocol, kern));
 }
 int stacker_socket_bind (struct socket * sock,
                     struct sockaddr * address, int addrlen)
@@ -699,11 +759,41 @@ void stacker_sk_free_security (struct sock *sk)
 {
     CALL_ALL(sk_free_security(sk));
 }
-unsigned int stacker_sk_getsid (struct sock *sk, struct flowi *fl, u8 dir)
-{
-    RETURN_ERROR_IF_ANY_ERROR(sk_getsid(sk, fl, dir));
+void stacker_sk_clone_security (const struct sock *sk, struct sock *newsk)
+{	
+	CALL_ALL(sk_clone_security(sk, newsk));
 }
+
+void stacker_sk_getsecid (struct sock *sk, u32 *secid)
+{
+    CALL_ALL(sk_getsecid(sk, secid));
+}
+
+void stacker_sock_graft(struct sock* sk, struct socket *parent)
+{	
+	CALL_ALL(sock_graft(sk, parent));
+}
+int stacker_inet_conn_request(struct sock *sk, struct sk_buff *skb,
+                                struct request_sock *req)
+{
+	RETURN_ERROR_IF_ANY_ERROR(inet_conn_request(sk, skb, req));
+}
+void stacker_inet_csk_clone(struct sock *newsk, const struct request_sock *req)
+{
+	CALL_ALL(inet_csk_clone(newsk, req));
+}
+void stacker_inet_conn_established(struct sock *sk, struct sk_buff *skb)
+{
+	CALL_ALL(inet_conn_established(sk, skb));
+}
+void stacker_req_classify_flow(const struct request_sock *req, struct flowi *fl)
+{
+	CALL_ALL(req_classify_flow(req, fl));
+}
+
+
 #endif /* CONFIG_SECURITY_NETWORK */
+
 
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
 int stacker_xfrm_policy_alloc_security (struct xfrm_policy *xp, struct xfrm_user_sec_ctx *sec_ctx)
@@ -734,9 +824,19 @@ int stacker_xfrm_state_delete_security (struct xfrm_state *x)
 {
     RETURN_ERROR_IF_ANY_ERROR(xfrm_state_delete_security(x));
 }
-int stacker_xfrm_policy_lookup(struct xfrm_policy *xp, u32 sk_sid, u8 dir){
+int stacker_xfrm_policy_lookup(struct xfrm_policy *xp, u32 fl_secsid, u8 dir)
 {
-    RETURN_ERROR_IF_ANY_ERROR(xfrm_policy_lookup(xp, sk_sid, dir));
+    RETURN_ERROR_IF_ANY_ERROR(xfrm_policy_lookup(xp, fl_secsid, dir));
+}
+
+int stacker_xfrm_state_pol_flow_match(struct xfrm_state *x, struct xfrm_policy *xp, struct flowi *fl)
+{
+	RETURN_ERROR_IF_ANY_ERROR(xfrm_state_pol_flow_match(x, xp, fl));
+}
+
+int stacker_xfrm_decode_session(struct sk_buff *skb, u32 *secid, int ckall)
+{
+	RETURN_ERROR_IF_ANY_ERROR(xfrm_decode_session(skb, secid, ckall));
 }
 #endif /* CONFIG_SECURITY_NETWORK_XFRM */
 
@@ -759,6 +859,22 @@ int stacker_key_permission(key_ref_t key_ref,
 }
 
 #endif  /* CONFIG_KEYS */
+
+#ifndef __GENKSYMS__
+int stacker_file_mmap_addr (struct file * file,
+				unsigned long reqprot,
+				unsigned long prot, unsigned long flags,
+				unsigned long addr, unsigned long addr_only)
+{
+    RETURN_ERROR_IF_ANY_ERROR(file_mmap_addr(file, reqprot, prot, flags, addr, addr_only));
+}
+int stacker_vm_enough_memory_mm (struct mm_struct *mm, long pages)
+{
+    RETURN_ERROR_IF_ANY_ERROR(vm_enough_memory_mm(mm, pages));
+}
+
+#endif
+
 
 
 static struct security_operations lsm_stacker_ops = {
@@ -798,6 +914,7 @@ static struct security_operations lsm_stacker_ops = {
     .sb_post_mountroot = stacker_sb_post_mountroot,
     .sb_post_addmount = stacker_sb_post_addmount,
     .sb_pivotroot = stacker_sb_pivotroot,
+    .sb_post_pivotroot = stacker_sb_post_pivotroot,
 
     .inode_alloc_security = stacker_inode_alloc_security,
     .inode_free_security = stacker_inode_free_security,
@@ -821,6 +938,7 @@ static struct security_operations lsm_stacker_ops = {
     .inode_getxattr = stacker_inode_getxattr,
     .inode_listxattr = stacker_inode_listxattr,
     .inode_removexattr = stacker_inode_removexattr,
+    .inode_xattr_getsuffix = stacker_inode_xattr_getsuffix,
     .inode_getsecurity = stacker_inode_getsecurity,
     .inode_setsecurity = stacker_inode_setsecurity,
     .inode_listsecurity = stacker_inode_listsecurity,
@@ -921,6 +1039,13 @@ static struct security_operations lsm_stacker_ops = {
     .socket_getpeersec_dgram = stacker_socket_getpeersec_dgram,
     .sk_alloc_security = stacker_sk_alloc_security,
     .sk_free_security = stacker_sk_free_security,
+    .sk_clone_security = stacker_sk_clone_security,
+    .sk_getsecid = stacker_sk_getsecid,
+    .sock_graft = stacker_sock_graft,
+    .inet_conn_request = stacker_inet_conn_request,
+    .inet_csk_clone = stacker_inet_csk_clone,
+    .inet_conn_established = stacker_inet_conn_established,
+    .req_classify_flow = stacker_req_classify_flow,
 #endif   /* CONFIG_SECURITY_NETWORK */
 
 #ifdef CONFIG_SECURITY_NETWORK_XFRM
@@ -932,46 +1057,57 @@ static struct security_operations lsm_stacker_ops = {
     .xfrm_state_free_security = stacker_xfrm_state_free_security,
     .xfrm_state_delete_security = stacker_xfrm_state_delete_security,
     .xfrm_policy_lookup = stacker_xfrm_policy_lookup,
+    .xfrm_state_pol_flow_match = stacker_xfrm_state_pol_flow_match,
+    .xfrm_decode_session = stacker_xfrm_decode_session,
 #endif  /* CONFIG_SECURITY_NETWORK_XFRM */
 
     /* key management security hooks */
 #ifdef CONFIG_KEYS
     .key_alloc = stacker_key_alloc,
     .key_free = stacker_key_free,
-    .key_permission = stacker_key_permission
+    .key_permission = stacker_key_permission,
 
 #endif  /* CONFIG_KEYS */
+
+#ifndef __GENKSYMS__
+    .file_mmap_addr = stacker_file_mmap_addr,
+    .vm_enough_memory_mm = stacker_vm_enough_memory_mm,
+#endif
+
 
 };
 
 
 
 	
-static char *module_name = "lsm_stacker";
+//static char *module_name = "lsm_stacker";
+
+
+
 static int __init lsm_stacker_init (void)
 {
-	int res;
-	struct sec_module *old_modules;
-	strcut secrity_operations **orignal_ops;
+	int res = 0;
+	struct security_operations **orignal_ops;
 
 	INIT_HLIST_HEAD(&stacker_head);
 
-	if (!security_reigster(&lsm_stacker_ops)) 
-		goto has_reg;
-	printk(KERN_INFO "has security module register");
-
-	if (!security_mod_register(module_name, &lsm_stacker_ops)) 
-		goto has_reg;
-	printk(KERN_INFO "current security module is not support"
-					"nultiple security modules");
-
-	orignal_ops = (struct security_operations **) __symbol_get("security_ops");
-
-	if (!orgnal_ops) {
+	orignal_ops =  __symbol_get("security_ops");
+	if (!orignal_ops) {
 		res = -1; 
 		printk(KERN_ERR "get security_ops symbol fail\n");
 		goto out;
 	}
+
+	lsm_default_fixup_ops = probe_find_symbol("security_fixup_ops");
+	if (!lsm_default_fixup_ops) {
+		res = -1; 
+		printk(KERN_ERR "get security_fixup_ops symbol fail %p\n", 
+				lsm_default_fixup_ops);
+		goto out;
+	}
+	
+	lsm_default_fixup_ops(&lsm_stacker_ops);
+
 
 	old_modules = kmalloc(sizeof(*old_modules), GFP_KERNEL);
 	if (!old_modules) {
@@ -979,16 +1115,16 @@ static int __init lsm_stacker_init (void)
 		goto out;
 	}
 
+        init_sec_module(old_modules);
+
 	old_modules->ops = *orignal_ops;
 	old_modules->modname = "orignal_sec_modules";
-	INIT_HLIST_NODE(&old_modules->hlist);
-	hlist_add_tail(&old_modules->hlist, &stacker_head);
+	hlist_add_head_rcu(&old_modules->hlist, &stacker_head);
 
 	smp_wmb();
 	*orignal_ops = &lsm_stacker_ops;
-	smb_wmb();
+	smp_wmb();
 
-has_reg:
 	printk(KERN_INFO "LSM STACKER MODULES REGISTER SUCCESS\n");
 
 out:
@@ -998,6 +1134,29 @@ out:
 
 static void __exit lsm_stacker_exit (void)
 {
+	struct security_operations **orignal_ops;
+
+
+	orignal_ops = (struct security_operations **) __symbol_get("security_ops");
+	if (!orignal_ops) {
+		printk(KERN_ERR "get security_ops symbol fail\n");
+		goto out;
+	}
+	if (!old_modules) 
+		goto out;
+	//sub modules unregister
+	LOCK_STACKER_FOR_READING; 
+	smp_wmb();
+	*orignal_ops = old_modules->ops;
+	smp_wmb();
+	while (atomic_read(&lsm_stacker_ref) != 1);
+	UNLOCK_STACKER_FOR_READING;
+
+	if (old_modules)
+		kfree(old_modules);
+
+	printk(KERN_INFO "LSM STACKER MODULES UNREGISTER SUCCESS\n");
+out:
 	return;
 }
 
