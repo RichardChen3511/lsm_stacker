@@ -600,6 +600,10 @@ int stacker_register_security (const char *name,
 {
 	struct sec_module *secmod;
 	char *modname;
+
+	if (!lsm_default_fixup_ops)
+        return -1;
+
  	secmod =  kmalloc(sizeof(*old_modules), GFP_KERNEL);
 	if (!secmod) 
 		return -ENOMEM;
@@ -610,8 +614,7 @@ int stacker_register_security (const char *name,
 		return -ENOMEM;
 	}
 
-	if (lsm_default_fixup_ops)
-		lsm_default_fixup_ops(ops);
+	lsm_default_fixup_ops(ops);
 	strcpy(modname, name);
 	secmod->modname = modname;
 	secmod->ops = ops;
